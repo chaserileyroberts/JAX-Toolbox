@@ -1,30 +1,30 @@
-From 37461f7b414c3c40c8730b5c2c9318329b8bc2d6 Mon Sep 17 00:00:00 2001
+From d427a9b8b057c98bd224e3b77fcd418f0e128b14 Mon Sep 17 00:00:00 2001
 From: ashors1 <ashors@nvidia.com>
 Date: Tue, 18 Jul 2023 10:27:03 -0700
-Subject: [PATCH 1/9] add TE support
+Subject: [PATCH 01/12] add TE support
 
 ---
  paxml/contrib/gpu/scripts_gpu/configs.py   |  22 +-
  paxml/contrib/gpu/scripts_gpu/te_helper.py | 324 +++++++++++++++++++++
- paxml/main.py                              |  67 +++--
+ paxml/main.py                              |  61 ++--
  paxml/tasks_lib.py                         |   3 +-
  paxml/trainer_lib.py                       |  36 ++-
- 5 files changed, 400 insertions(+), 52 deletions(-)
+ 5 files changed, 396 insertions(+), 50 deletions(-)
  create mode 100644 paxml/contrib/gpu/scripts_gpu/te_helper.py
 
 diff --git a/paxml/contrib/gpu/scripts_gpu/configs.py b/paxml/contrib/gpu/scripts_gpu/configs.py
-index 2aceb30..934530e 100644
+index cb5ad52..16d4125 100644
 --- a/paxml/contrib/gpu/scripts_gpu/configs.py
 +++ b/paxml/contrib/gpu/scripts_gpu/configs.py
-@@ -23,6 +23,7 @@ from paxml.contrib.gpu.scripts_gpu.llama_utils import BaseLLaMA
- from paxml.contrib.gpu.scripts_gpu.tasks import BoolQDataset
+@@ -28,6 +28,7 @@ from paxml.contrib.gpu.scripts_gpu.tasks import BoolQDataset
  from paxml.contrib.gpu.scripts_gpu.tasks import LambadaDataset
  from paxml.contrib.gpu.scripts_gpu.tasks import PileUnsupervisedDataset
+ from paxml.tasks.lm.model_params import maybe_setup_moe_params
 +from paxml.contrib.gpu.scripts_gpu.te_helper import TransformerEngineHelper
  from paxml.tasks.lm.params.c4 import TransformerLmSpmdAdam
  from paxml.tasks.lm.params.lm_cloud import SyntheticDataset
  from praxis import base_layer
-@@ -111,7 +112,7 @@ class GPT126MBase(TransformerLmSpmdAdam):
+@@ -116,7 +117,7 @@ class GPT126MBase(TransformerLmSpmdAdam):
  
    MAX_SEQ_LEN = 2048
    VOCAB_SIZE = 50304
@@ -33,7 +33,7 @@ index 2aceb30..934530e 100644
    PERCORE_BATCH_SIZE = 4
  
    NUM_LAYERS = 12
-@@ -166,10 +167,21 @@ class GPT126MBase(TransformerLmSpmdAdam):
+@@ -171,10 +172,21 @@ class GPT126MBase(TransformerLmSpmdAdam):
          fdl.get_callable(stacked_p), transformers.StackedTransformerRepeated
      ):
        stacked_p = stacked_p.block
@@ -58,7 +58,7 @@ index 2aceb30..934530e 100644
  
      model_p.params_init = WeightInit.Gaussian(self.INIT_STD)
      softmax_init = WeightInit.Gaussian(self.SOFTMAX_INIT_STD)
-@@ -234,7 +246,7 @@ class GPT175BBase(GPT126MBase):
+@@ -239,7 +251,7 @@ class GPT175BBase(GPT126MBase):
    # Known as MLP_DIM in t5x
    HIDDEN_DIMS = MODEL_DIMS * 4
    # Defaults to MODEL_DIMS // NUM_HEADS.
@@ -398,20 +398,20 @@ index 0000000..d44ca67
 +        finally:
 +            pass
 diff --git a/paxml/main.py b/paxml/main.py
-index d04332a..fd5228e 100644
+index f03e2d4..f087f27 100644
 --- a/paxml/main.py
 +++ b/paxml/main.py
-@@ -50,6 +50,7 @@ from paxml import tf_data_service_lib
- from paxml import train
+@@ -52,6 +52,7 @@ from paxml import train
  from paxml import trainer_lib
  from paxml import tuning_lib
+ from paxml import ml_monitoring
 +from paxml.contrib.gpu.scripts_gpu.te_helper import TransformerEngineHelper
  from praxis import pax_fiddle
  from praxis import py_utils
  
-@@ -510,39 +511,41 @@ def _main(argv: Sequence[str]) -> None:
-                                                       FLAGS.host_idx)
-                      )
+@@ -519,35 +520,36 @@ def create_experiment_config():
+       ),
+   )
  
 -  if FLAGS.exp is not None:
 -    experiment_config = get_experiment(FLAGS.exp)()
@@ -472,19 +472,19 @@ index d04332a..fd5228e 100644
 +          'No experiment provided. At least one of --exp, --fdl,'
 +          ' --fdl_config, or --fdl_config_file is required.'
 +      )
-+
  
--  experiment_config.validate()
--  run(experiment_config=experiment_config,
--      enable_checkpoint_saving=FLAGS.enable_checkpoint_saving)
-+    experiment_config.validate()
-+    run(experiment_config=experiment_config,
-+        enable_checkpoint_saving=FLAGS.enable_checkpoint_saving)
+   experiment_config.validate()
+   return experiment_config
+@@ -571,7 +573,6 @@ def _main(argv: Sequence[str]) -> None:
+       startup_random_jitter_max_secs=FLAGS.startup_random_jitter_max_secs,
+   )
  
- 
+-
  _TASK_HANDLE_RE = re.compile(r'(?:logs\.)?(\d+)\.(.*)\.([^.]+)\.\d+')
+ 
+ if __name__ == '__main__':
 diff --git a/paxml/tasks_lib.py b/paxml/tasks_lib.py
-index cfdc402..e475099 100644
+index 010998d..4b90282 100644
 --- a/paxml/tasks_lib.py
 +++ b/paxml/tasks_lib.py
 @@ -43,6 +43,7 @@ from paxml import checkpoint_types
@@ -654,13 +654,13 @@ index 6ec25e8..0342328 100644
  
    train_state_partition_specs = (
 -- 
-2.25.1
+2.47.1
 
 
-From 371b48043de072908aca80ba8b16f34008bd875c Mon Sep 17 00:00:00 2001
+From 3a37cdae1ab420890284647bda008615c9069ab2 Mon Sep 17 00:00:00 2001
 From: Ming-Xu Huang <mingh@nvidia.com>
 Date: Wed, 27 Sep 2023 10:46:53 +0800
-Subject: [PATCH 2/9] Adding dropout support when enabling TE.
+Subject: [PATCH 02/12] Adding dropout support when enabling TE.
 
 ---
  paxml/contrib/gpu/scripts_gpu/te_helper.py | 10 ++++++++++
@@ -688,13 +688,13 @@ index d44ca67..2b9dba4 100644
          assert self.packed_input == False
          assert len(self.moe_layers) == 0
 -- 
-2.25.1
+2.47.1
 
 
-From 272e6352128962a9b2da10133737f3e1343bd36c Mon Sep 17 00:00:00 2001
+From 9fc82c91ac28cc4e7fe6b6b071631c07cbbdef22 Mon Sep 17 00:00:00 2001
 From: Ming-Xu Huang <mingh@nvidia.com>
 Date: Tue, 24 Oct 2023 10:30:27 +0800
-Subject: [PATCH 3/9] Set deterministic=True for inference.
+Subject: [PATCH 03/12] Set deterministic=True for inference.
 
 ---
  paxml/contrib/gpu/scripts_gpu/te_helper.py | 3 ++-
@@ -715,13 +715,13 @@ index 2b9dba4..ef20305 100644
      return x_out
  
 -- 
-2.25.1
+2.47.1
 
 
-From dfbf3a90cc0d93aa7d8e9c55c95ccf98c67f70bb Mon Sep 17 00:00:00 2001
+From ea6dd6c65b4dcf965f2c1c5e2b502f80a9142ed1 Mon Sep 17 00:00:00 2001
 From: Reese Wang <rewang@nvidia.com>
 Date: Thu, 2 Nov 2023 22:04:58 -0700
-Subject: [PATCH 4/9] Fix the excluded list for excluded_for_learner
+Subject: [PATCH 04/12] Fix the excluded list for excluded_for_learner
 
 Signed-off-by: Reese Wang <rewang@nvidia.com>
 ---
@@ -742,13 +742,13 @@ index 0342328..2e9bfd6 100644
      vars_with_opt = tasks_lib.filter_vars_for_grad_or_opt(
          mdl_vars, excluded_for_learner
 -- 
-2.25.1
+2.47.1
 
 
-From 041456a8d4eb39350349101e263cb09f80b2b88c Mon Sep 17 00:00:00 2001
+From f740f17fbb13b4262238736c7d678dc8bcea1f1f Mon Sep 17 00:00:00 2001
 From: Ming-Xu Huang <mingh@nvidia.com>
 Date: Tue, 7 Nov 2023 11:21:53 +0800
-Subject: [PATCH 5/9] Adapting to TE/JAX/Custom_partitioning.
+Subject: [PATCH 05/12] Adapting to TE/JAX/Custom_partitioning.
 
 ---
  paxml/contrib/gpu/scripts_gpu/te_helper.py | 6 ++++--
@@ -779,13 +779,13 @@ index ef20305..fed1601 100644
          finally:
              pass
 -- 
-2.25.1
+2.47.1
 
 
-From 7d976d6510d8d5f751fd566ed2703bfa2d0a89d0 Mon Sep 17 00:00:00 2001
+From 03ef6221821896155b78b8a193df2091b096252d Mon Sep 17 00:00:00 2001
 From: Ming-Xu Huang <mingh@nvidia.com>
 Date: Tue, 7 Nov 2023 15:14:25 +0800
-Subject: [PATCH 6/9] Adding TE-compatiable PipelinedTransformer
+Subject: [PATCH 06/12] Adding TE-compatiable PipelinedTransformer
 
 ---
  paxml/contrib/gpu/scripts_gpu/te_helper.py | 109 +++++++++++++++++++++
@@ -946,13 +946,13 @@ index fed1601..5914e54 100644
      def update_fp8_metas_if_needed(mdl_vars, grads):
          return TransformerEngineHelper.get_helper().update_fp8_metas_if_needed(mdl_vars, grads)
 -- 
-2.25.1
+2.47.1
 
 
-From a1bb3c7d24817e1a77219f1cdfdb70b34157fda2 Mon Sep 17 00:00:00 2001
+From 2e2081ec97e73d9c212dcfb83713a87eea374396 Mon Sep 17 00:00:00 2001
 From: Ming-Xu Huang <mingh@nvidia.com>
 Date: Wed, 8 Nov 2023 10:06:49 +0800
-Subject: [PATCH 7/9] Apply OWG to TE's FP8 meta
+Subject: [PATCH 07/12] Apply OWG to TE's FP8 meta
 
 ---
  paxml/contrib/gpu/scripts_gpu/te_helper.py | 59 ----------------------
@@ -1107,13 +1107,13 @@ index 2e9bfd6..270fb3d 100644
          grads, states.opt_states[0], vars_with_opt, wps_with_opt
      )
 -- 
-2.25.1
+2.47.1
 
 
-From 0d07668f96ea4e106388fbfdc47ae228918ec135 Mon Sep 17 00:00:00 2001
+From 9df77b4399f983e71d276ddf487abe588a13191b Mon Sep 17 00:00:00 2001
 From: Ming-Xu Huang <mingh@nvidia.com>
 Date: Wed, 15 Nov 2023 14:43:17 +0800
-Subject: [PATCH 8/9] Remove Praxis related setup (Moving to Praxis TE/Patch)
+Subject: [PATCH 08/12] Remove Praxis related setup (Moving to Praxis TE/Patch)
 
 ---
  paxml/contrib/gpu/scripts_gpu/configs.py   |   9 -
@@ -1121,10 +1121,10 @@ Subject: [PATCH 8/9] Remove Praxis related setup (Moving to Praxis TE/Patch)
  2 files changed, 324 deletions(-)
 
 diff --git a/paxml/contrib/gpu/scripts_gpu/configs.py b/paxml/contrib/gpu/scripts_gpu/configs.py
-index 934530e..fd01c74 100644
+index 16d4125..7d50a52 100644
 --- a/paxml/contrib/gpu/scripts_gpu/configs.py
 +++ b/paxml/contrib/gpu/scripts_gpu/configs.py
-@@ -173,15 +173,6 @@ class GPT126MBase(TransformerLmSpmdAdam):
+@@ -178,15 +178,6 @@ class GPT126MBase(TransformerLmSpmdAdam):
        transformer_layer_p = stacked_p.transformer_layer_params_tpl
        transformer_layer_p.ln_tpl.reductions_in_fp32 = True
        transformer_layer_p.tr_fflayer_tpl.ln_tpl.reductions_in_fp32 = True
@@ -1499,13 +1499,13 @@ index fd482df..b271258 100644
      @contextmanager
      def fp8_autocast(dp_mesh_axis="replica", tp_mesh_axis="mdl", fsdp_mesh_axis="data"):
 -- 
-2.25.1
+2.47.1
 
 
-From f94e783f56454d758b8cbab81f5ce756835fd065 Mon Sep 17 00:00:00 2001
+From 3297966c11624d3f692f3450f4eb1acd28b3964e Mon Sep 17 00:00:00 2001
 From: Ming-Xu Huang <mingh@nvidia.com>
 Date: Wed, 15 Nov 2023 14:51:14 +0800
-Subject: [PATCH 9/9] Fix missing DEFAULT_INIT_MUTABLE_LIST
+Subject: [PATCH 09/12] Fix missing DEFAULT_INIT_MUTABLE_LIST
 
 ---
  paxml/contrib/gpu/scripts_gpu/te_helper.py | 4 ++++
@@ -1534,5 +1534,144 @@ index b271258..cbac7cf 100644
  
  class TransformerEngineHelperBase:
 -- 
-2.25.1
+2.47.1
+
+
+From 65b00553378aead4b083e7154540b6fd0a3a8f4e Mon Sep 17 00:00:00 2001
+From: Hemil Desai <hemild@nvidia.com>
+Date: Mon, 12 Feb 2024 10:22:15 -0800
+Subject: [PATCH 10/12] Revert mutable kwarg in abstract_init_with_metadata in
+ init checkpoint rule
+
+---
+ paxml/tasks_lib.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/paxml/tasks_lib.py b/paxml/tasks_lib.py
+index 4b90282..e210d63 100644
+--- a/paxml/tasks_lib.py
++++ b/paxml/tasks_lib.py
+@@ -1787,7 +1787,7 @@ class SingleTask(base_task.BaseTask):
+       )
+     # Initialize with a dummy seed
+     var_weight_hparams = ckpt_task.model.abstract_init_with_metadata(
+-        inputs_shape_dtype, mutable=DEFAULT_INIT_MUTABLE_LIST)
++        inputs_shape_dtype, extra_mutable_list=DEFAULT_INIT_MUTABLE_LIST)
+     ckpt_train_state = ckpt_task.create_train_state_padded_shapes(
+         var_weight_hparams)
+     train_state_pspecs = ckpt_task.create_train_state_partition_specs(
+-- 
+2.47.1
+
+
+From 4516dbb067a28677ceae31411f8003d021b9e8e3 Mon Sep 17 00:00:00 2001
+From: Ming Huang <mingh@nvidia.com>
+Date: Fri, 12 Apr 2024 20:14:01 +0000
+Subject: [PATCH 11/12] Support FM32 to OWG parameters.
+
+Signed-off-by: Ming Huang <mingh@nvidia.com>
+---
+ paxml/trainer_lib.py | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/paxml/trainer_lib.py b/paxml/trainer_lib.py
+index 270fb3d..a9afc9e 100644
+--- a/paxml/trainer_lib.py
++++ b/paxml/trainer_lib.py
+@@ -26,6 +26,7 @@ import clu.metrics
+ from etils import epath
+ import fiddle as fdl
+ from flax import struct as flax_struct
++from flax.linen.fp8_ops import fm32
+ import jax
+ from jax import numpy as jnp
+ from jax.experimental import pjit
+@@ -35,7 +36,7 @@ from paxml import learners as learners_lib
+ from paxml import sgf
+ from paxml import tasks_lib
+ from paxml import train_states
+-from paxml.contrib.gpu.scripts_gpu.te_helper import TransformerEngineHelper, DEFAULT_INIT_MUTABLE_LIST
++from paxml.contrib.gpu.scripts_gpu.te_helper import DEFAULT_INIT_MUTABLE_LIST
+ from praxis import asserts
+ from praxis import base_hyperparams
+ from praxis import base_input
+@@ -804,6 +805,21 @@ def _default_apply_fn(
+   )
+ 
+ 
++def _maybe_to_fm32_vars(mdl_vars, var_weight_hparams):
++    asserts.assert_same_structure(mdl_vars, var_weight_hparams)
++
++    def _maybe_fm32_var_fn(var, var_param):
++      if base_layer.var_overwrite_with_gradient(var_param):
++        return jax.lax.convert_element_type(var, fm32)
++      else:
++        return var
++
++    is_leaf = lambda x: not isinstance(x, (tuple, dict, list))
++    return jax.tree_util.tree_map(
++        _maybe_fm32_var_fn, mdl_vars, var_weight_hparams, is_leaf=is_leaf
++    )
++
++
+ class LossFnProtocol(Protocol):
+ 
+   def __call__(
+@@ -834,6 +850,8 @@ def _get_default_loss_fn(
+     else:
+       assert NotImplementedError(f'fprop_dtype {fprop_dtype} not supported.')
+ 
++    mdl_vars = _maybe_to_fm32_vars(mdl_vars, var_weight_hparams)
++
+     with base_layer.JaxContext.new_context(hparams=context_p):
+       k1, k2, k3 = jax.random.split(prng_key, 3)
+       (metrics, per_example_output), updated_vars = apply_fn(
+-- 
+2.47.1
+
+
+From 9e625dc25f441ca3bc408000d94b5ec9c8ded1d4 Mon Sep 17 00:00:00 2001
+From: ashors1 <ashors@nvidia.com>
+Date: Tue, 29 Oct 2024 09:33:04 -0700
+Subject: [PATCH 12/12] fix OOM with TE
+
+Signed-off-by: ashors1 <ashors@nvidia.com>
+---
+ paxml/main.py | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/paxml/main.py b/paxml/main.py
+index f087f27..c0173df 100644
+--- a/paxml/main.py
++++ b/paxml/main.py
+@@ -551,7 +551,7 @@ def create_experiment_config():
+           ' --fdl_config, or --fdl_config_file is required.'
+       )
+ 
+-  experiment_config.validate()
++    experiment_config.validate()
+   return experiment_config
+ 
+ 
+@@ -567,11 +567,13 @@ def _main(argv: Sequence[str]) -> None:
+   with ml_monitoring.ml_event_logger(ml_monitoring.MlEvent.INITIALIZE_SETUP):
+     experiment_config = create_experiment_config()
+ 
+-  run(
+-      experiment_config=experiment_config,
+-      enable_checkpoint_saving=FLAGS.enable_checkpoint_saving,
+-      startup_random_jitter_max_secs=FLAGS.startup_random_jitter_max_secs,
+-  )
++  with TransformerEngineHelper.fp8_autocast('replica', 'mdl', 'data'):
++    run(
++        experiment_config=experiment_config,
++        enable_checkpoint_saving=FLAGS.enable_checkpoint_saving,
++        startup_random_jitter_max_secs=FLAGS.startup_random_jitter_max_secs,
++    )
++
+ 
+ _TASK_HANDLE_RE = re.compile(r'(?:logs\.)?(\d+)\.(.*)\.([^.]+)\.\d+')
+ 
+-- 
+2.47.1
 
